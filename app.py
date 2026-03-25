@@ -173,11 +173,11 @@ header { display: none !important; }
 
 # ── 에이전트 로직 ──────────────────────────────────────────────────────────────
 WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
-SUBAGENT_MODEL  = "claude-sonnet-4-5"
-ORCHESTRATOR_MODEL = "claude-opus-4-5"
+SUBAGENT_MODEL     = "claude-haiku-4-5-20251001"   # 저렴한 모델로 JD 수집
+ORCHESTRATOR_MODEL = "claude-sonnet-4-5"            # Opus → Sonnet으로 변경
 
 
-def run_agent(client, system, prompt, model=None, max_tokens=4000, use_search=True):
+def run_agent(client, system, prompt, model=None, max_tokens=2000, use_search=True):
     model = model or SUBAGENT_MODEL
     tools = [WEB_SEARCH_TOOL] if use_search else []
     messages = [{"role": "user", "content": prompt}]
@@ -218,7 +218,7 @@ URL: {url}
 
 [{{"title":"직함","team":"팀/부서","location":"위치","date":"날짜","role_id":"ID (있으면)"}}]
 
-최대한 많이 수집해. (목표: 20건 이상)"""
+최대 10건만 수집해. 가장 최근 공고 위주로."""
 
     result = run_agent(client, None, prompt)
     try:
@@ -415,7 +415,7 @@ def synthesize_briefing(client, company, url, filter_keyword, jds, signals, log)
 - 모든 전략 추론에 대안 해석 필수
 - JD 원문 구체적 인용 (15단어 미만)"""
 
-    result = run_agent(client, None, prompt, model=ORCHESTRATOR_MODEL, max_tokens=6000, use_search=False)
+    result = run_agent(client, None, prompt, model=ORCHESTRATOR_MODEL, max_tokens=4000, use_search=False)
     log("✓ 브리핑 완성!", "ok")
     return result
 
@@ -488,7 +488,7 @@ if run_btn and api_key and company and url:
             st.error("공고 목록을 수집하지 못했습니다. URL과 회사명을 확인해주세요.")
             st.stop()
 
-        jds     = collect_jd_details(client, jobs[:30], company, log)
+        jds     = collect_jd_details(client, jobs[:10], company, log)
         signals = extract_signals(client, jds, company, log)
         briefing = synthesize_briefing(client, company, url, filter_kw, jds, signals, log)
 
