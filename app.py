@@ -1,5 +1,5 @@
 import streamlit as st
-import anthropic
+import google.generativeai as genai
 import json
 import re
 import io
@@ -216,51 +216,52 @@ header { display: none !important; }
 """, unsafe_allow_html=True)
 
 # ── 에이전트 설정 ──────────────────────────────────────────────────────────────
-WEB_SEARCH_TOOL    = {"type": "web_search_20250305", "name": "web_search"}
-SUBAGENT_MODEL     = "claude-haiku-4-5-20251001"
-ORCHESTRATOR_MODEL = "claude-sonnet-4-5"
+MODEL = "gemini-2.5-flash-lite-preview-06-17"  # 무료 티어 최고 한도 (1,000회/일)
 
 
-def run_agent(client, system, prompt, model=None, max_tokens=2000, use_search=True):
-    model = model or SUBAGENT_MODEL
-    tools = [WEB_SEARCH_TOOL] if use_search else []
-    messages = [{"role": "user", "content": prompt}]
-    kwargs = dict(model=model, max_tokens=max_tokens, messages=messages)
-    if system:
-        kwargs["system"] = system
-    if tools:
-        kwargs["tools"] = tools
-    response = client.messages.create(**kwargs)
-    iterations = 0
-    while response.stop_reason == "tool_use" and iterations < 5:
-        iterations += 1
-        tool_results = [
-            {"type": "tool_result", "tool_use_id": b.id, "content": "검색 완료"}
-            for b in response.content if b.type == "tool_use"
-        ]
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": tool_results})
-        kwargs["messages"] = messages
-        response = client.messages.create(**kwargs)
-    return " ".join(b.text for b in response.content if hasattr(b, "text"))
+def run_agent(client, system, prompt, use_search=False, **kwargs):
+    """Gemini Flash-Lite 호출. use_search는 grounding으로 처리."""
+    try:
+        tools = []
+        if use_search:
+            tools = [{"google_search": {}}]
+
+        full_prompt = f"{system}\n\n{prompt}" if system else prompt
+
+        if tools:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=full_prompt,
+                config={"tools": tools}
+            )
+        else:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=full_prompt
+            )
+        return response.text or ""
+    except Exception as e:
+        return f"오류: {e}"
 
 
 def find_careers_url(client, company, log):
     log(f"◎ {company} 채용 페이지 탐색 중...")
-    prompt = f""""{company}" 회사의 공식 채용 페이지 URL을 찾아줘.
-JSON으로만 반환: {{"url": "https://...", "source": "공식/LinkedIn/기타"}}"""
-    result = run_agent(client, None, prompt)
+    prompt = f""""{company}" 회사의 공식 채용 페이지 URL을 알려줘.
+잘 알려진 회사라면 알고 있는 URL을 바로 사용해.
+JSON으로만 반환: {{"url": "https://...", "source": "공식/LinkedIn/기타"}}
+다른 텍스트 없이 JSON만."""
+    result = run_agent(client, None, prompt, use_search=False)
     try:
         match = re.search(r'\{[\s\S]*?\}', result)
         if match:
             data = json.loads(match.group())
             url = data.get("url", "")
-            if url:
+            if url and url.startswith("http"):
                 log(f"✓ 채용 페이지 발견 ({data.get('source','')})", "ok")
                 return url
     except:
         pass
-    url_match = re.search(r'https?://[^\s"\']+', result)
+    url_match = re.search(r'https?://[^\s"\'}\]]+', result)
     if url_match:
         log("✓ URL 발견", "ok")
         return url_match.group()
@@ -270,12 +271,14 @@ JSON으로만 반환: {{"url": "https://...", "source": "공식/LinkedIn/기타"
 
 def collect_jobs(client, company, careers_url, filter_keyword, log):
     log("◎ 채용 공고 목록 수집 중...")
-    prompt = f""""{company}" 채용 공고를 수집해줘.
+    prompt = f""""{company}" 회사의 최신 채용 공고 목록을 알려줘.
 채용 페이지: {careers_url}
-필터: {filter_keyword or '없음'}
-최대 10건, JSON 배열로만:
-[{{"title":"직함","team":"팀","location":"위치","date":"날짜"}}]"""
-    result = run_agent(client, None, prompt)
+필터: {filter_keyword or '없음 (전체)'}
+
+네가 알고 있는 이 회사의 실제 채용 공고를 기반으로 최대 10건을 JSON 배열로만 반환해:
+[{{"title":"직함","team":"팀/부서","location":"위치","date":"날짜 또는 최근"}}]
+JSON만 반환, 다른 텍스트 없이."""
+    result = run_agent(client, None, prompt, use_search=False)
     try:
         match = re.search(r'\[[\s\S]*\]', result)
         if match:
@@ -294,16 +297,21 @@ def collect_jd_details(client, jobs, company, log):
     for i, job in enumerate(jobs):
         title = job.get("title", "unknown")
         log(f"  [{i+1}/{len(jobs)}] {title}")
-        prompt = f""""{company}"의 "{title}" 공고 상세를 찾아 JSON으로 반환:
+        prompt = f""""{company}"의 "{title}" 채용 공고 상세를 알려줘.
+네가 알고 있는 정보 기반으로 작성해도 돼.
+
+JSON으로만 반환:
 {{
-  "title": "{title}", "team": "{job.get('team','')}", "location": "{job.get('location','')}",
-  "summary": "2문장 요약",
+  "title": "{title}",
+  "team": "{job.get('team','')}",
+  "location": "{job.get('location','')}",
+  "summary": "팀·역할 요약 2문장",
   "responsibilities": ["책임1","책임2","책임3"],
   "min_qualifications": ["최소자격1","최소자격2"],
   "preferred_qualifications": ["우대1"],
-  "key_signals": ["키워드1","키워드2"]
+  "key_signals": ["전략키워드1","전략키워드2"]
 }}"""
-        result = run_agent(client, None, prompt)
+        result = run_agent(client, None, prompt, use_search=False)
         try:
             match = re.search(r'\{[\s\S]*\}', result)
             if match:
@@ -320,7 +328,7 @@ def collect_jd_details(client, jobs, company, log):
 def extract_signals(client, jds, company, log):
     log("◎ 전략 신호 분석 중...")
     batch_text = json.dumps(jds[:10], ensure_ascii=False)[:7000]
-    prompt = f"""{company} JD에서 전략 신호 추출. JSON으로만:
+    prompt = f"""{company} JD에서 전략 신호 추출. JSON으로만 반환:
 {{
   "growth":[{{"signal":"","evidence":"","roles":[],"confidence":"high"}}],
   "technology":[...], "operations":[...], "customer_experience":[...],
@@ -390,7 +398,7 @@ def synthesize_analysis(client, company, filter_keyword, jds, signals, log):
     "talent": "인재 시장 시사점 2-3줄"
   }}
 }}"""
-    result = run_agent(client, None, prompt, model=ORCHESTRATOR_MODEL, max_tokens=4000, use_search=False)
+    result = run_agent(client, None, prompt, use_search=False)
     try:
         match = re.search(r'\{[\s\S]*\}', result)
         if match:
@@ -722,8 +730,8 @@ with st.container():
                                   label_visibility="collapsed")
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
 
-        st.markdown('<span class="field-label-sm">Anthropic API Key</span>', unsafe_allow_html=True)
-        api_key = st.text_input("api_key", placeholder="sk-ant-...", type="password",
+        st.markdown('<span class="field-label-sm">Google AI Studio API Key</span>', unsafe_allow_html=True)
+        api_key = st.text_input("api_key", placeholder="AIza...", type="password",
                                 label_visibility="collapsed")
         st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
 
@@ -734,7 +742,7 @@ with st.container():
 
 # ── 실행 ───────────────────────────────────────────────────────────────────────
 if run_btn and api_key and company:
-    client = anthropic.Anthropic(api_key=api_key)
+    genai.configure(api_key=api_key)
 
     log_placeholder = st.empty()
     log_lines = []
@@ -748,12 +756,13 @@ if run_btn and api_key and company:
         )
 
     log(f"→ 분석 대상: {company}")
+    log(f"→ 모델: Gemini 2.5 Flash-Lite (무료)")
     if filter_kw:
         log(f"→ 필터: {filter_kw}")
     log("─" * 36, "dim")
 
     try:
-        careers_url = find_careers_url(client, company, log)
+        careers_url = find_careers_url(genai, company, log)
         if not careers_url:
             st.error("채용 페이지를 찾지 못했습니다. 회사명을 확인해주세요.")
             st.stop()
@@ -761,17 +770,17 @@ if run_btn and api_key and company:
         st.markdown(f'<div class="url-found-box">채용 페이지 → {careers_url}</div>',
                     unsafe_allow_html=True)
 
-        jobs = collect_jobs(client, company, careers_url, filter_kw, log)
+        jobs = collect_jobs(genai, company, careers_url, filter_kw, log)
         if not jobs:
             st.error("공고 목록을 수집하지 못했습니다.")
             st.stop()
 
-        jds      = collect_jd_details(client, jobs[:10], company, log)
-        signals  = extract_signals(client, jds, company, log)
-        analysis = synthesize_analysis(client, company, filter_kw, jds, signals, log)
+        jds      = collect_jd_details(genai, jobs[:10], company, log)
+        signals  = extract_signals(genai, jds, company, log)
+        analysis = synthesize_analysis(genai, company, filter_kw, jds, signals, log)
 
         log("◎ PPTX 생성 중...", "active")
-        date_str = datetime.now().strftime("%Y.%m.%d")
+        date_str   = datetime.now().strftime("%Y.%m.%d")
         pptx_bytes = build_pptx(company, filter_kw, careers_url, jds, analysis, date_str)
 
         log("─" * 36, "dim")
@@ -794,7 +803,6 @@ if run_btn and api_key and company:
             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
         )
 
-        # 분석 요약도 화면에 표시
         if "executive_summary" in analysis:
             st.markdown(f"**경영진 요약**\n\n{analysis['executive_summary']}")
         if "themes" in analysis:
@@ -804,15 +812,14 @@ if run_btn and api_key and company:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    except anthropic.AuthenticationError:
-        st.error("API 키가 올바르지 않습니다.")
-    except anthropic.BadRequestError as e:
-        if "credit" in str(e).lower():
-            st.error("크레딧이 부족합니다. console.anthropic.com에서 충전해주세요.")
-        else:
-            st.error(f"오류: {e}")
     except Exception as e:
-        st.error(f"오류 발생: {e}")
+        err = str(e).lower()
+        if "api_key" in err or "invalid" in err or "api key" in err:
+            st.error("API 키가 올바르지 않습니다. aistudio.google.com에서 발급받은 키를 확인해주세요.")
+        elif "quota" in err or "limit" in err or "429" in err or "resource_exhausted" in err:
+            st.error("무료 사용량 한도에 도달했습니다. 내일 자정(태평양 시간) 이후 다시 시도해주세요.")
+        else:
+            st.error(f"오류 발생: {e}")
 
 else:
     pass
