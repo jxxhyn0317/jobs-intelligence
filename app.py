@@ -13,7 +13,7 @@ from docx.oxml import OxmlElement
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = "AIzaSyBqf6XTwXdiY-QeShQsMq3aqcr582eB-mM"
-MODEL          = "gemini-2.0-flash-lite"
+MODEL          = "gemini-1.5-pro"  # Pro 업그레이드 — 전략 추론 품질 향상
 
 st.set_page_config(page_title="JD Analyst", page_icon="◎", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -154,6 +154,24 @@ def collect_all_jobs(company: str, careers_url: str, filter_kw: str, log) -> lis
         {"title": f"Principal {fk} Architect", "team": "Engineering", "location": "Seoul"},
     ]
 
+# ── URL에서 JD 텍스트 추출 ────────────────────────────────────────────────────
+def fetch_jd_text(url: str) -> str:
+    """URL에서 JD 텍스트 추출. JS 렌더링 사이트는 부분적으로만 가능."""
+    try:
+        import urllib.request
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+        req  = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        # 태그 제거 + 공백 정리
+        text = re.sub(r'<script[\s\S]*?</script>', '', raw, flags=re.IGNORECASE)
+        text = re.sub(r'<style[\s\S]*?</style>',  '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text[:8000]  # 앞 8000자
+    except:
+        return ""
+
 # ── Step 2: 각 공고 내부 심층 분석 ──────────────────────────────────────────
 def deep_analyze_jd(company: str, job: dict, idx: int, total: int, log) -> dict:
     title    = job.get("title","")
@@ -161,119 +179,252 @@ def deep_analyze_jd(company: str, job: dict, idx: int, total: int, log) -> dict:
     location = job.get("location","")
     url      = job.get("url","")
 
-    log(f"  [{idx}/{total}] {title} 분석 중...")
+    log(f"  [{idx}/{total}] {title}")
 
-    result = ask(f""""{company}"의 "{title}" 채용 공고를 상세히 분석해줘.
-팀: {team} | 위치: {location} | URL: {url or "N/A"}
+    # URL이 있으면 실제 내용 fetch 시도
+    jd_content = ""
+    if url and url.startswith("http"):
+        jd_content = fetch_jd_text(url)
+        if jd_content:
+            log(f"    → 실제 JD 내용 {len(jd_content)}자 추출", "ok")
 
-이 직무에 대해 네가 아는 내용을 최대한 상세히 작성해.
-반드시 JSON만 출력 (마크다운 없이):
+    # 프롬프트: 실제 내용이 있으면 그걸 기반으로, 없으면 모델 지식 활용
+    if jd_content:
+        content_block = f"""
+아래는 실제 채용 공고 페이지에서 추출한 텍스트야. 이 내용을 기반으로 분석해줘:
+---
+{jd_content}
+---"""
+    else:
+        content_block = f'"{company}"의 "{title}" 채용 공고에 대해 네가 아는 정보를 최대한 상세하게 사용해줘.'
+
+    result = ask(f"""당신은 McKinsey 파트너급 전략 애널리스트입니다. 아래 채용 공고를 분석해서 이 회사가 무엇을 하려는지를 역추적하세요.
+
+회사: {company}
+직무: {title} | 팀: {team} | 위치: {location}
+{content_block}
+
+분석 지침:
+- Job Description, Responsibilities, Qualifications에 나오는 구체적 단어/문구를 직접 인용해서 근거로 삼으세요.
+- 단순히 "AI 역량 강화"같은 추상적 판단이 아니라, "이 회사가 구체적으로 무엇을 만들려 하는가"를 추론하세요.
+- 요구 기술 스택, 경험 요구사항에서 현재 회사의 기술 수준과 격차를 파악하세요.
+- "Preferred Qualifications"는 회사가 가장 원하는 미래 방향을 드러내는 핵심 단서입니다.
+
+반드시 순수 JSON만 출력 (```코드블록 없이):
 {{
   "title": "{title}",
   "team": "{team}",
   "location": "{location}",
-  "summary": "이 직무의 핵심 역할과 팀 소개 (3-4문장)",
-  "responsibilities": ["주요 책임 1", "주요 책임 2", "주요 책임 3", "주요 책임 4", "주요 책임 5"],
-  "min_qualifications": ["필수 자격 1", "필수 자격 2", "필수 자격 3"],
-  "preferred_qualifications": ["우대 자격 1", "우대 자격 2"],
-  "tech_stack": ["기술1", "기술2"],
-  "key_signals": ["전략 신호 키워드1", "전략 신호 키워드2", "전략 신호 키워드3"],
-  "strategic_implication": "이 채용이 시사하는 전략적 의미 (2문장)"
+  "role_summary": "이 직무가 조직 내에서 어떤 역할을 하는지 — 3문장. 단순 업무 설명이 아닌 전략적 맥락 포함.",
+  "what_they_will_build": "이 사람이 실제로 만들거나 해결할 것 — 구체적으로 2-3문장",
+  "responsibilities_analysis": [
+    {{"responsibility": "실제 책임 항목 원문 요약", "what_it_signals": "이것이 시사하는 전략적 의미"}},
+    {{"responsibility": "책임 항목 2", "what_it_signals": "전략적 의미 2"}},
+    {{"responsibility": "책임 항목 3", "what_it_signals": "전략적 의미 3"}}
+  ],
+  "qualification_signals": [
+    {{"qualification": "자격 요건 원문 요약", "why_it_matters": "이 요건을 요구하는 이유와 전략적 함의"}}
+  ],
+  "preferred_qual_signals": [
+    {{"qualification": "우대 자격 원문", "strategic_intent": "이 우대 자격이 드러내는 회사의 미래 방향"}}
+  ],
+  "tech_stack": ["실제 언급된 기술1", "기술2", "기술3"],
+  "capability_gap": "이 채용이 메우려는 현재 조직의 역량 공백 — 구체적으로",
+  "strategic_implication": "이 단 하나의 채용 공고가 시사하는 전략적 의미 — 4-5문장. JD의 구체적 문구를 근거로 인용하면서 분석."
 }}""")
 
     data = parse_json(result)
-    if isinstance(data, dict) and "summary" in data:
+    if isinstance(data, dict) and "role_summary" in data:
         return data
 
-    # 파싱 실패 시 기본 구조 반환
     return {
         "title": title, "team": team, "location": location,
-        "summary": f"{company}의 {team} 부서에서 {title}을 채용하고 있습니다.",
-        "responsibilities": ["핵심 제품/서비스 개발", "크로스펑셔널 협업", "기술 전략 수립"],
-        "min_qualifications": ["관련 분야 경력 5년+", "전문 기술 역량"],
-        "preferred_qualifications": ["글로벌 경험", "리더십 경험"],
-        "tech_stack": [], "key_signals": [team, "성장"],
-        "strategic_implication": f"{company}의 {team} 역량 강화 신호."
+        "role_summary": f"{company}의 {team} 부서에서 {title}을 채용합니다.",
+        "what_they_will_build": f"{team} 관련 핵심 제품 및 시스템 개발.",
+        "responsibilities_analysis": [
+            {"responsibility": "핵심 제품 개발", "what_it_signals": "주력 서비스 강화"},
+            {"responsibility": "크로스펑셔널 협업", "what_it_signals": "조직 통합 추진"},
+        ],
+        "qualification_signals": [
+            {"qualification": "관련 분야 경력 5년+", "why_it_matters": "즉시 전력 투입 가능한 시니어 선호"}
+        ],
+        "preferred_qual_signals": [
+            {"qualification": "글로벌 경험", "strategic_intent": "글로벌 시장 대응 역량 확보"}
+        ],
+        "tech_stack": [], "capability_gap": f"{team} 분야 전문 역량 보강",
+        "strategic_implication": f"{company}의 {team} 역량 강화를 위한 전략적 채용입니다."
     }
 
 # ── Step 3: 전략 통합 분석 ───────────────────────────────────────────────────
 def strategic_synthesis(company: str, filter_kw: str, jds: list, log) -> dict:
-    log("◎ 전략 신호 통합 분석 중...")
-    roles_summary = json.dumps(
-        [{"title": j.get("title"), "team": j.get("team"),
-          "signals": j.get("key_signals",[]), "implication": j.get("strategic_implication","")}
-         for j in jds[:30]], ensure_ascii=False)[:6000]
+    log("◎ 전략 통합 분석 및 이니셔티브 예측 중...")
 
-    result = ask(f"""다음 {company} 채용 데이터 {len(jds)}건을 분석해서 전략 인텔리전스 보고서를 작성해줘.
-{f"필터: {filter_kw}" if filter_kw else ""}
+    # JD 분석 결과를 풍부하게 취합
+    jd_digest = []
+    for j in jds[:25]:
+        entry = {
+            "title": j.get("title",""),
+            "team": j.get("team",""),
+            "what_they_will_build": j.get("what_they_will_build",""),
+            "capability_gap": j.get("capability_gap",""),
+            "strategic_implication": j.get("strategic_implication",""),
+            "tech_stack": j.get("tech_stack",[]),
+            "preferred_quals": [s.get("strategic_intent","") for s in j.get("preferred_qual_signals",[])],
+            "resp_signals": [s.get("what_it_signals","") for s in j.get("responsibilities_analysis",[])]
+        }
+        jd_digest.append(entry)
 
-데이터: {roles_summary}
+    digest_text = json.dumps(jd_digest, ensure_ascii=False)[:9000]
 
-반드시 JSON만 출력 (마크다운 없이):
+    result = ask(f"""당신은 McKinsey Senior Partner이자 전략 인텔리전스 전문가입니다.
+{company}의 채용 공고 {len(jds)}건을 심층 분석한 결과를 바탕으로 전략 보고서를 작성하세요.
+{f"분석 범위: {filter_kw} 관련 직무" if filter_kw else ""}
+
+채용 공고 분석 데이터:
+{digest_text}
+
+아래 JSON 구조로 분석 결과를 작성하세요. 각 항목은 반드시 구체적이고 실질적이어야 합니다.
+단순한 "AI 강화", "디지털 전환" 같은 추상적 표현은 금지입니다.
+JD에서 실제로 확인된 단어, 기술, 역할을 근거로 인용하세요.
+반드시 순수 JSON만 출력 (```코드블록 없이):
+
 {{
-  "executive_summary": "경영진 요약 4-5문장. {company}의 채용 패턴이 시사하는 전략 방향.",
-  "key_judgments": [
-    {{"level":"high","text":"핵심 판단 1 — 강한 근거가 있는 것"}},
-    {{"level":"high","text":"핵심 판단 2"}},
-    {{"level":"medium","text":"중간 신뢰도 판단"}},
-    {{"level":"low","text":"낮은 신뢰도 판단"}}
+  "one_line_verdict": "{company}가 지금 하려는 것을 한 문장으로 — 구체적으로",
+
+  "executive_summary": "경영진이 읽을 5-6문장 요약. 이 회사가 채용 패턴을 통해 드러내는 전략 방향, 조직 변화, 기술 방향을 구체적으로. JD에서 실제 확인된 내용을 근거로.",
+
+  "strategic_directions": [
+    {{
+      "direction": "큰 방향성 제목 — 구체적으로 (예: '자체 AI 추론 엔진 내재화', '리테일 미디어 네트워크 구축')",
+      "confidence": "高/中/低",
+      "evidence_count": 5,
+      "evidence_from_jds": "이 방향을 뒷받침하는 JD의 구체적 문구나 역할 3가지",
+      "why_now": "왜 지금 이 방향인가 — 시장/경쟁 맥락과 연결",
+      "what_success_looks_like": "이 방향이 성공하면 18개월 후 이 회사는 어떤 모습인가"
+    }},
+    {{
+      "direction": "큰 방향성 2",
+      "confidence": "高/中/低",
+      "evidence_count": 3,
+      "evidence_from_jds": "JD 근거",
+      "why_now": "맥락",
+      "what_success_looks_like": "성공 시 모습"
+    }},
+    {{
+      "direction": "큰 방향성 3",
+      "confidence": "中",
+      "evidence_count": 2,
+      "evidence_from_jds": "JD 근거",
+      "why_now": "맥락",
+      "what_success_looks_like": "성공 시 모습"
+    }}
   ],
-  "themes": [
-    {{"rank":1,"name":"테마명","confidence":"高","posting_count":5,"evidence":"구체적 JD 근거 문구","interpretation":"전략 해석 2-3문장","alternative":"대안 해석","roles":["역할1","역할2"]}},
-    {{"rank":2,"name":"테마명2","confidence":"中","posting_count":3,"evidence":"근거2","interpretation":"해석2","alternative":"대안2","roles":["역할3"]}},
-    {{"rank":3,"name":"테마명3","confidence":"中","posting_count":2,"evidence":"근거3","interpretation":"해석3","alternative":"대안3","roles":["역할4"]}},
-    {{"rank":4,"name":"테마명4","confidence":"低","posting_count":2,"evidence":"근거4","interpretation":"해석4","alternative":"대안4","roles":["역할5"]}},
-    {{"rank":5,"name":"테마명5","confidence":"低","posting_count":1,"evidence":"근거5","interpretation":"해석5","alternative":"대안5","roles":["역할6"]}}
+
+  "predicted_initiatives": [
+    {{
+      "initiative": "구체적 실행 이니셔티브 이름 (예: '자체 LLM 파인튜닝 파이프라인 구축', '리얼타임 개인화 추천 엔진 V2')",
+      "likelihood": "High/Medium/Low",
+      "timeline": "예상 시작 시점 (예: 6개월 이내, 12개월 이내)",
+      "evidence": "이 이니셔티브를 예측하는 JD 근거",
+      "what_they_need": "이 이니셔티브에 필요한 인재/기술 (채용 공고에서 확인된 것)",
+      "strategic_impact": "이 이니셔티브가 시장에 미칠 영향"
+    }},
+    {{
+      "initiative": "이니셔티브 2",
+      "likelihood": "High/Medium/Low",
+      "timeline": "예상 시점",
+      "evidence": "JD 근거",
+      "what_they_need": "필요 역량",
+      "strategic_impact": "시장 영향"
+    }},
+    {{
+      "initiative": "이니셔티브 3",
+      "likelihood": "Medium",
+      "timeline": "예상 시점",
+      "evidence": "JD 근거",
+      "what_they_need": "필요 역량",
+      "strategic_impact": "시장 영향"
+    }},
+    {{
+      "initiative": "이니셔티브 4",
+      "likelihood": "Medium",
+      "timeline": "예상 시점",
+      "evidence": "JD 근거",
+      "what_they_need": "필요 역량",
+      "strategic_impact": "시장 영향"
+    }},
+    {{
+      "initiative": "이니셔티브 5",
+      "likelihood": "Low",
+      "timeline": "예상 시점",
+      "evidence": "JD 근거",
+      "what_they_need": "필요 역량",
+      "strategic_impact": "시장 영향"
+    }}
   ],
-  "tech_investments": ["기술투자1","기술투자2","기술투자3"],
-  "uncertainties": [
-    {{"topic":"불확실 사항1","needed":"필요 정보1"}},
-    {{"topic":"불확실 사항2","needed":"필요 정보2"}}
+
+  "capability_map": {{
+    "building_now": ["지금 확실히 구축 중인 역량 1 (JD 근거 있음)", "역량 2", "역량 3"],
+    "likely_next": ["다음 6-12개월 내 구축할 것으로 예상되는 역량", "역량 2"],
+    "notable_absences": ["눈에 띄게 채용하지 않는 역량 — 이 공백의 전략적 의미"]
+  }},
+
+  "tech_bets": [
+    {{"technology": "기술명", "signal_strength": "Strong/Moderate/Weak", "inference": "이 기술에 베팅하는 이유 추론"}}
   ],
-  "implications": {{
-    "competitors": "경쟁사 시사점 2-3줄",
-    "partners": "파트너 시사점 2-3줄",
-    "talent": "인재 시장 시사점 2-3줄"
-  }}
+
+  "competitive_implications": {{
+    "for_competitors": "경쟁사는 이 채용 패턴에서 무엇을 경계해야 하는가 — 구체적으로 3-4문장",
+    "for_partners": "파트너/벤더는 어떤 기회와 위협을 마주하게 되는가 — 3문장",
+    "for_talent_market": "이 채용이 인재 시장에 미치는 영향 — 어떤 스킬셋의 몸값이 오르는가"
+  }},
+
+  "key_uncertainties": [
+    {{"question": "이 분석에서 가장 불확실한 것", "why_it_matters": "이게 틀리면 분석 전체가 바뀌는 이유"}}
+  ]
 }}""")
 
     data = parse_json(result)
-    if isinstance(data, dict) and "executive_summary" in data:
+    if isinstance(data, dict) and "strategic_directions" in data:
         log("✓ 전략 분석 완료", "ok")
         return data
 
     log("→ Fallback 분석 적용", "dim")
-    teams    = list(set([j.get("team","") for j in jds if j.get("team")]))[:4]
-    titles   = [j.get("title","") for j in jds[:5]]
-    signals  = list(set(sum([j.get("key_signals",[]) for j in jds[:20]], [])))[:8]
+    teams   = list(set([j.get("team","") for j in jds if j.get("team")]))[:4]
+    titles  = [j.get("title","") for j in jds[:5]]
+    impls   = [j.get("strategic_implication","") for j in jds[:5] if j.get("strategic_implication")]
     return {
-        "executive_summary": f"{company}은 총 {len(jds)}건의 채용 공고를 통해 {', '.join(teams[:3])} 분야에서 적극적인 인재 확보에 나서고 있다. 채용 패턴은 기술 역량 내재화와 조직 규모 확장을 동시에 추구하는 전략을 반영한다. 특히 {teams[0] if teams else '엔지니어링'} 분야의 시니어급 채용이 두드러지며, 이는 핵심 기술 자산의 내부 구축을 우선시하는 경영 방침과 일치한다.",
-        "key_judgments": [
-            {"level":"high",   "text": f"{company}가 {teams[0] if teams else '기술'} 분야 핵심 역량 내재화에 집중 투자 중"},
-            {"level":"high",   "text": f"{len(jds)}건의 동시 채용은 조직 대규모 확장 또는 신사업 런칭 신호"},
-            {"level":"medium", "text": f"{', '.join(teams[:2])} 부서 동시 채용은 신규 이니셔티브 가능성 시사"},
-            {"level":"low",    "text": "일부 공고의 글로벌 위치 설정은 해외 시장 진출 준비 가능성"}
+        "one_line_verdict": f"{company}는 {teams[0] if teams else '핵심 기술'} 역량을 내재화하고 제품 경쟁력을 강화하려 한다.",
+        "executive_summary": f"{company}은 {len(jds)}건의 채용을 통해 {', '.join(teams[:3])} 분야의 조직 역량을 강화하고 있다. " + (impls[0] if impls else ""),
+        "strategic_directions": [
+            {"direction": f"{teams[0] if teams else '기술'} 역량 내재화", "confidence": "高",
+             "evidence_count": min(len(jds),6),
+             "evidence_from_jds": f"{titles[0] if titles else '시니어 엔지니어'} 등 채용 확인",
+             "why_now": "경쟁 심화에 따른 핵심 역량 직접 보유 전략",
+             "what_success_looks_like": "18개월 내 핵심 기능 외부 의존도 50% 감소"}
         ],
-        "themes": [
-            {"rank":1,"name":f"{teams[0] if teams else '기술'} 역량 강화","confidence":"高",
-             "posting_count":min(len(jds),6),"evidence":f"{titles[0] if titles else '시니어 엔지니어'} 채용",
-             "interpretation":f"{company}가 {teams[0] if teams else '핵심 기술'} 분야 내부 역량 확보에 집중하고 있다. 외부 의존도 축소와 기술 주권 확보가 핵심 목표로 보인다.",
-             "alternative":"이탈 인력 대체를 위한 정기 채용일 수 있음","roles":titles[:3]},
-            {"rank":2,"name":"제품/서비스 확장","confidence":"中",
-             "posting_count":min(len(jds),4),"evidence":"복수 부서 동시 채용",
-             "interpretation":"PM·엔지니어링·디자인 복합 채용은 신규 제품 라인 준비 신호다. 조직 구성 패턴이 신규 이니셔티브 팀 빌딩과 일치한다.",
-             "alternative":"기존 제품 유지보수 인력 충원일 수 있음","roles":titles[1:4]},
+        "predicted_initiatives": [
+            {"initiative": f"{teams[0] if teams else '기술'} 플랫폼 자체 구축",
+             "likelihood": "High", "timeline": "6-12개월",
+             "evidence": f"{titles[0] if titles else '관련 직무'} 채용 공고",
+             "what_they_need": f"{teams[0] if teams else '기술'} 전문가",
+             "strategic_impact": "시장 경쟁력 강화"}
         ],
-        "tech_investments": signals[:5] if signals else ["AI/ML","클라우드","데이터 플랫폼"],
-        "uncertainties": [
-            {"topic":"채용 시점과 사업 런칭 연계","needed":"내부 로드맵 정보"},
-            {"topic":"예산 규모 및 우선순위","needed":"조직도 및 예산 배분 정보"}
-        ],
-        "implications": {
-            "competitors": f"{company}의 {teams[0] if teams else '핵심'} 분야 인재 집중 채용은 경쟁사와의 인재 확보 경쟁을 심화시킨다. 동일 인재풀을 공유하는 경쟁사는 채용 비용 상승과 타임라인 지연에 직면할 것.",
-            "partners": f"핵심 기능 내재화 방향은 외부 파트너·벤더의 협상력을 약화시킬 수 있다. 특히 {teams[0] if teams else '기술'} 분야 협력사는 계약 갱신 시 압박을 받을 가능성이 있다.",
-            "talent": f"{', '.join(teams[:2]) if teams else '관련 분야'} 경력자 수요 급증 예상. 시니어급 인재의 몸값 상승과 이직 활성화가 전망된다."
-        }
+        "capability_map": {
+            "building_now": teams[:3] if teams else ["기술 역량"],
+            "likely_next": ["글로벌 확장", "AI 통합"],
+            "notable_absences": ["외부 파트너십 채용 없음 — 내재화 전략 신호"]
+        },
+        "tech_bets": [{"technology": "AI/ML", "signal_strength": "Moderate", "inference": "다수 JD에서 AI 관련 경험 요구"}],
+        "competitive_implications": {
+            "for_competitors": f"{company}의 핵심 역량 강화는 경쟁사와의 기술 격차를 확대할 수 있다.",
+            "for_partners": "내재화 전략은 기존 파트너십 계약 구조에 압박을 가할 수 있다.",
+            "for_talent_market": f"{', '.join(teams[:2]) if teams else '관련 분야'} 경력자 수요 급증 예상."
+        },
+        "key_uncertainties": [
+            {"question": "채용이 신규 사업 빌딩인지 기존 이탈 대체인지",
+             "why_it_matters": "이에 따라 전략 방향 해석이 완전히 달라짐"}
+        ]
     }
 
 # ── Word 문서 생성 ─────────────────────────────────────────────────────────────
@@ -299,6 +450,322 @@ def add_para(doc, text, style=None, bold=False, size=None, color=None,
     return p
 
 def build_docx(company, filter_kw, careers_url, jds, synthesis, date_str):
+    doc = Document()
+    section = doc.sections[0]
+    section.page_width  = Inches(8.5)
+    section.page_height = Inches(11)
+    section.left_margin = section.right_margin = Inches(1.2)
+    section.top_margin  = section.bottom_margin = Inches(1.0)
+
+    styles = doc.styles
+    def S(name, base, size, bold=False, color="1A1A1A", sb=10, sa=5, font="Calibri"):
+        try:    s = styles[name]
+        except: s = styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+        s.base_style = styles[base]
+        s.font.name  = font
+        s.font.size  = Pt(size)
+        s.font.bold  = bold
+        s.font.color.rgb = RGBColor(*bytes.fromhex(color))
+        s.paragraph_format.space_before = Pt(sb)
+        s.paragraph_format.space_after  = Pt(sa)
+        return s
+
+    S("JD_Cover",   "Normal", 40, bold=True,  color="003366", sb=0,  sa=6,  font="Georgia")
+    S("JD_H1",      "Normal", 14, bold=True,  color="003366", sb=18, sa=4,  font="Georgia")
+    S("JD_H2",      "Normal", 12, bold=True,  color="1A1A1A", sb=12, sa=3,  font="Georgia")
+    S("JD_Lead",    "Normal", 12, bold=False, color="222222", sb=4,  sa=4,  font="Calibri")
+    S("JD_Body",    "Normal", 11, bold=False, color="333333", sb=3,  sa=3,  font="Calibri")
+    S("JD_Caption", "Normal",  9, bold=False, color="888888", sb=2,  sa=2,  font="Calibri")
+    S("JD_Tag",     "Normal",  9, bold=True,  color="FFFFFF", sb=0,  sa=0,  font="Calibri")
+
+    def rule(doc, color="003366", size=6):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(2)
+        p.paragraph_format.space_after  = Pt(2)
+        pPr = p._p.get_or_add_pPr()
+        pBdr = OxmlElement('w:pBdr')
+        bot = OxmlElement('w:bottom')
+        bot.set(qn('w:val'),'single'); bot.set(qn('w:sz'), str(size))
+        bot.set(qn('w:space'),'1');   bot.set(qn('w:color'), color)
+        pBdr.append(bot); pPr.append(pBdr)
+
+    def bullet(doc, text, indent=0.3, color="333333"):
+        p = doc.add_paragraph(style="JD_Body")
+        p.paragraph_format.left_indent   = Inches(indent)
+        p.paragraph_format.first_line_indent = Inches(-0.2)
+        r = p.add_run(f"▸  {text}")
+        r.font.color.rgb = RGBColor(*bytes.fromhex(color))
+        return p
+
+    def label_text(doc, label, text, label_color="003366", indent=0.2):
+        p = doc.add_paragraph(style="JD_Body")
+        p.paragraph_format.left_indent = Inches(indent)
+        r1 = p.add_run(f"{label}  ")
+        r1.bold = True
+        r1.font.color.rgb = RGBColor(*bytes.fromhex(label_color))
+        p.add_run(text)
+        return p
+
+    # ── 표지 ─────────────────────────────────────────────────────────────────
+    doc.add_paragraph()
+    doc.add_paragraph()
+    p = doc.add_paragraph(style="JD_Cover")
+    p.add_run(company.upper())
+
+    p2 = doc.add_paragraph(style="JD_Lead")
+    r = p2.add_run("Strategic Intelligence Report — Job Description Analysis")
+    r.font.color.rgb = RGBColor(85,119,153)
+    r.font.bold = True
+
+    doc.add_paragraph()
+    for meta in [f"Date: {date_str}", f"Postings Analyzed: {len(jds)}",
+                 f"Filter: {filter_kw or 'All Roles'}", f"Source: {careers_url}"]:
+        pm = doc.add_paragraph(style="JD_Caption")
+        pm.add_run(meta)
+
+    rule(doc)
+    doc.add_paragraph()
+
+    # One-line verdict 박스
+    verdict = synthesis.get("one_line_verdict","")
+    if verdict:
+        pv = doc.add_paragraph(style="JD_Lead")
+        r1 = pv.add_run("BOTTOM LINE:  ")
+        r1.bold = True
+        r1.font.color.rgb = RGBColor(0,51,102)
+        pv.add_run(verdict)
+        pv.paragraph_format.left_indent = Inches(0.2)
+
+    doc.add_page_break()
+
+    # ── PART 1: 경영진 요약 ──────────────────────────────────────────────────
+    doc.add_paragraph("PART 1. EXECUTIVE SUMMARY", style="JD_H1")
+    rule(doc)
+    doc.add_paragraph()
+    p_es = doc.add_paragraph(style="JD_Lead")
+    p_es.add_run(synthesis.get("executive_summary",""))
+    doc.add_paragraph()
+
+    # ── PART 2: 전략 방향성 ──────────────────────────────────────────────────
+    doc.add_paragraph("PART 2. STRATEGIC DIRECTIONS", style="JD_H1")
+    rule(doc)
+    p_intro = doc.add_paragraph(style="JD_Caption")
+    p_intro.add_run("채용 공고 분석으로 도출한 이 회사의 큰 전략 방향. 신뢰도는 JD 내 실제 근거 수에 비례.")
+    doc.add_paragraph()
+
+    for d in synthesis.get("strategic_directions", []):
+        conf = d.get("confidence","中")
+        conf_color = {"高":"003366","中":"555555","低":"888888"}.get(conf,"555555")
+
+        p_dh = doc.add_paragraph(style="JD_H2")
+        r_c = p_dh.add_run(f"[신뢰도 {conf}]  ")
+        r_c.font.color.rgb = RGBColor(*bytes.fromhex(conf_color))
+        r_c.font.size = Pt(10)
+        p_dh.add_run(d.get("direction",""))
+
+        label_text(doc, "근거 공고:", f"{d.get('evidence_count',0)}건 — {d.get('evidence_from_jds','')}")
+        label_text(doc, "왜 지금인가:", d.get("why_now",""))
+        label_text(doc, "성공 시 18개월 후:", d.get("what_success_looks_like",""))
+        doc.add_paragraph()
+
+    doc.add_page_break()
+
+    # ── PART 3: 예상 실행 이니셔티브 ────────────────────────────────────────
+    doc.add_paragraph("PART 3. PREDICTED INITIATIVES", style="JD_H1")
+    rule(doc)
+    p_i = doc.add_paragraph(style="JD_Caption")
+    p_i.add_run("채용 공고에서 역추론한 구체적 실행 이니셔티브. 공식 발표 전 선행 지표로 해석.")
+    doc.add_paragraph()
+
+    like_colors = {"High":"C00000","Medium":"7F7F7F","Low":"AAAAAA"}
+    for ini in synthesis.get("predicted_initiatives", []):
+        lk = ini.get("likelihood","Medium")
+        lk_color = like_colors.get(lk,"7F7F7F")
+
+        p_ih = doc.add_paragraph(style="JD_H2")
+        r_lk = p_ih.add_run(f"[{lk} Likelihood]  ")
+        r_lk.font.color.rgb = RGBColor(*bytes.fromhex(lk_color))
+        r_lk.font.size = Pt(10)
+        p_ih.add_run(ini.get("initiative",""))
+
+        label_text(doc, "예상 시점:", ini.get("timeline",""))
+        label_text(doc, "JD 근거:", ini.get("evidence",""))
+        label_text(doc, "필요 역량:", ini.get("what_they_need",""))
+        label_text(doc, "시장 영향:", ini.get("strategic_impact",""))
+        doc.add_paragraph()
+
+    doc.add_page_break()
+
+    # ── PART 4: 역량 맵 & 기술 베팅 ─────────────────────────────────────────
+    doc.add_paragraph("PART 4. CAPABILITY MAP & TECHNOLOGY BETS", style="JD_H1")
+    rule(doc)
+    doc.add_paragraph()
+
+    cap_map = synthesis.get("capability_map", {})
+    p_ch1 = doc.add_paragraph(style="JD_H2")
+    p_ch1.add_run("지금 구축 중 (JD에서 확인됨)")
+    for item in cap_map.get("building_now", []):
+        bullet(doc, item, color="003366")
+
+    doc.add_paragraph()
+    p_ch2 = doc.add_paragraph(style="JD_H2")
+    p_ch2.add_run("다음 단계 예상")
+    for item in cap_map.get("likely_next", []):
+        bullet(doc, item, color="555555")
+
+    doc.add_paragraph()
+    p_ch3 = doc.add_paragraph(style="JD_H2")
+    p_ch3.add_run("주목할 공백 — 채용하지 않는 영역")
+    for item in cap_map.get("notable_absences", []):
+        bullet(doc, item, color="888888")
+
+    doc.add_paragraph()
+    p_tb = doc.add_paragraph(style="JD_H2")
+    p_tb.add_run("기술 베팅 신호")
+    for tech in synthesis.get("tech_bets", []):
+        sig = tech.get("signal_strength","Moderate")
+        sig_label = {"Strong":"●●●","Moderate":"●●○","Weak":"●○○"}.get(sig,"●●○")
+        p_t = doc.add_paragraph(style="JD_Body")
+        p_t.paragraph_format.left_indent = Inches(0.3)
+        r_sig = p_t.add_run(f"{sig_label}  {tech.get('technology','')}  ")
+        r_sig.bold = True
+        p_t.add_run(f"— {tech.get('inference','')}")
+
+    doc.add_page_break()
+
+    # ── PART 5: 공고별 상세 분석 ─────────────────────────────────────────────
+    doc.add_paragraph("PART 5. JOB POSTING DEEP ANALYSIS", style="JD_H1")
+    rule(doc)
+    p_cnt = doc.add_paragraph(style="JD_Caption")
+    p_cnt.add_run(f"총 {len(jds)}건 채용 공고 — Description·Responsibilities·Qualifications 기반 심층 분석")
+    doc.add_paragraph()
+
+    for i, jd in enumerate(jds):
+        p_jt = doc.add_paragraph(style="JD_H2")
+        r_i = p_jt.add_run(f"{i+1:02d}.  ")
+        r_i.font.color.rgb = RGBColor(0,51,102)
+        p_jt.add_run(jd.get("title",""))
+
+        pm = doc.add_paragraph(style="JD_Caption")
+        pm.add_run(f"{jd.get('team','')}  ·  {jd.get('location','')}")
+        pm.paragraph_format.left_indent = Inches(0.3)
+        doc.add_paragraph()
+
+        # 역할 요약
+        if jd.get("role_summary"):
+            p_rs = doc.add_paragraph(style="JD_Body")
+            p_rs.paragraph_format.left_indent = Inches(0.3)
+            p_rs.add_run(jd.get("role_summary",""))
+
+        # 무엇을 만드는가
+        if jd.get("what_they_will_build"):
+            doc.add_paragraph()
+            label_text(doc, "이 사람이 실제로 만들 것:", jd.get("what_they_will_build",""), indent=0.3)
+
+        # Responsibilities 분석
+        resp_analysis = jd.get("responsibilities_analysis", [])
+        if resp_analysis:
+            doc.add_paragraph()
+            p_rl = doc.add_paragraph(style="JD_H2")
+            p_rl.paragraph_format.left_indent = Inches(0.3)
+            p_rl.add_run("Responsibilities 분석")
+            for ra in resp_analysis:
+                p_r = doc.add_paragraph(style="JD_Body")
+                p_r.paragraph_format.left_indent = Inches(0.5)
+                r1 = p_r.add_run(f"▸ {ra.get('responsibility','')}  ")
+                r1.bold = True
+                r2 = p_r.add_run(f"→ {ra.get('what_it_signals','')}")
+                r2.font.color.rgb = RGBColor(0,51,102)
+                r2.font.italic = True
+
+        # Qualifications 분석
+        qual_signals = jd.get("qualification_signals", [])
+        pref_signals = jd.get("preferred_qual_signals", [])
+        if qual_signals or pref_signals:
+            doc.add_paragraph()
+            p_ql = doc.add_paragraph(style="JD_H2")
+            p_ql.paragraph_format.left_indent = Inches(0.3)
+            p_ql.add_run("Qualifications 분석")
+            for qs in qual_signals:
+                p_q = doc.add_paragraph(style="JD_Body")
+                p_q.paragraph_format.left_indent = Inches(0.5)
+                r1 = p_q.add_run(f"[필수] {qs.get('qualification','')}  ")
+                r1.bold = True
+                p_q.add_run(f"→ {qs.get('why_it_matters','')}")
+            for ps in pref_signals:
+                p_p = doc.add_paragraph(style="JD_Body")
+                p_p.paragraph_format.left_indent = Inches(0.5)
+                r1 = p_p.add_run(f"[우대] {ps.get('qualification','')}  ")
+                r1.bold = True
+                r1.font.color.rgb = RGBColor(0,51,102)
+                p_p.add_run(f"→ {ps.get('strategic_intent','')}")
+                p_p.runs[-1].font.color.rgb = RGBColor(0,51,102)
+
+        # 역량 공백 & 전략적 시사점
+        if jd.get("capability_gap"):
+            doc.add_paragraph()
+            label_text(doc, "메우려는 역량 공백:", jd.get("capability_gap",""), indent=0.3)
+
+        if jd.get("strategic_implication"):
+            doc.add_paragraph()
+            p_si = doc.add_paragraph(style="JD_Body")
+            p_si.paragraph_format.left_indent = Inches(0.3)
+            p_si.paragraph_format.space_before = Pt(4)
+            r_si = p_si.add_run("전략적 시사점:  ")
+            r_si.bold = True
+            r_si.font.color.rgb = RGBColor(0,51,102)
+            r_si.font.size = Pt(11)
+            r2 = p_si.add_run(jd.get("strategic_implication",""))
+            r2.font.color.rgb = RGBColor(0,51,102)
+            r2.font.italic = True
+
+        # Tech stack
+        ts = jd.get("tech_stack", [])
+        if ts:
+            p_ts = doc.add_paragraph(style="JD_Caption")
+            p_ts.paragraph_format.left_indent = Inches(0.3)
+            p_ts.add_run(f"Tech: {' · '.join(ts)}")
+
+        rule(doc, color="DDDDDD", size=2)
+        doc.add_paragraph()
+
+    doc.add_page_break()
+
+    # ── PART 6: 경쟁 시사점 & 불확실성 ──────────────────────────────────────
+    doc.add_paragraph("PART 6. COMPETITIVE IMPLICATIONS & UNCERTAINTIES", style="JD_H1")
+    rule(doc)
+    doc.add_paragraph()
+
+    ci = synthesis.get("competitive_implications", {})
+    for label, key in [("경쟁사에 주는 의미", "for_competitors"),
+                       ("파트너/벤더에 주는 의미", "for_partners"),
+                       ("인재 시장에 주는 의미", "for_talent_market")]:
+        p_cl = doc.add_paragraph(style="JD_H2")
+        p_cl.add_run(label)
+        p_cb = doc.add_paragraph(style="JD_Body")
+        p_cb.add_run(ci.get(key,""))
+        p_cb.paragraph_format.left_indent = Inches(0.2)
+        doc.add_paragraph()
+
+    doc.add_paragraph("핵심 불확실성", style="JD_H2")
+    for u in synthesis.get("key_uncertainties", []):
+        p_u = doc.add_paragraph(style="JD_Body")
+        p_u.paragraph_format.left_indent = Inches(0.2)
+        r1 = p_u.add_run(f"Q: {u.get('question','')}  ")
+        r1.bold = True
+        p_u.add_run(f"→ {u.get('why_it_matters','')}")
+
+    # 푸터
+    doc.add_paragraph()
+    rule(doc)
+    pf = doc.add_paragraph(style="JD_Caption")
+    pf.add_run(f"Generated by JD Analyst  ·  {date_str}  ·  {company}  ·  {len(jds)} postings analyzed")
+    pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
     doc = Document()
 
     # 페이지 설정
@@ -569,6 +1036,15 @@ with st.container():
         company = st.text_input("company", placeholder="Apple / Samsung / Google ...",
                                 label_visibility="collapsed")
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        st.markdown('<span class="field-label">JD URLs &nbsp;<span style="color:#2a2a2a;font-size:9px;letter-spacing:0.1em;">OPTIONAL — 분석할 채용공고 URL (여러 개면 줄바꿈으로 구분)</span></span>',
+                    unsafe_allow_html=True)
+        jd_urls_raw = st.text_area("jd_urls",
+                                   placeholder="https://jobs.apple.com/en-us/details/...\nhttps://jobs.apple.com/en-us/details/...",
+                                   height=100,
+                                   label_visibility="collapsed")
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
         st.markdown('<span class="field-label">Filter &nbsp;<span style="color:#2a2a2a;font-size:9px;letter-spacing:0.1em;">OPTIONAL</span></span>',
                     unsafe_allow_html=True)
         filter_kw = st.text_input("filter",
@@ -597,8 +1073,13 @@ if run_btn and company:
             unsafe_allow_html=True)
 
     log(f"→ 분석 대상: {company}")
-    log(f"→ 모델: Gemini 2.0 Flash-Lite")
+    log(f"→ 모델: Gemini 1.5 Pro")
     if filter_kw: log(f"→ 필터: {filter_kw}")
+
+    # 사용자가 직접 입력한 JD URL 파싱
+    manual_urls = [u.strip() for u in jd_urls_raw.strip().split("\n") if u.strip().startswith("http")]
+    if manual_urls:
+        log(f"→ 직접 입력 URL {len(manual_urls)}건 감지", "ok")
     log("─" * 36, "dim")
 
     try:
@@ -607,8 +1088,18 @@ if run_btn and company:
         st.markdown(f'<div class="url-found-box">채용 페이지 → {careers_url}</div>',
                     unsafe_allow_html=True)
 
-        # 1. 전체 공고 수집
-        jobs = collect_all_jobs(company, careers_url, filter_kw, log)
+        # 1. 공고 수집: 직접 입력 URL 우선, 없으면 자동 수집
+        if manual_urls:
+            log(f"◎ 직접 입력 URL {len(manual_urls)}건으로 분석 시작...")
+            jobs = [{"title": f"JD {i+1}", "team": "", "location": "", "url": u}
+                    for i, u in enumerate(manual_urls)]
+            # URL에서 제목 추출 시도
+            for job in jobs:
+                slug = job["url"].rstrip("/").split("/")[-1].replace("-"," ").replace("_"," ")
+                if slug and len(slug) > 3:
+                    job["title"] = slug.title()
+        else:
+            jobs = collect_all_jobs(company, careers_url, filter_kw, log)
 
         # 2. 각 공고 심층 분석
         log(f"◎ {len(jobs)}건 공고 내부 심층 분석 시작...")
