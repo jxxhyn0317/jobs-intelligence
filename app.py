@@ -118,7 +118,7 @@ st.markdown("""
 .stTextInput > div > div > input::placeholder { color: #2e2e2e !important; text-align: center !important; }
 
 /* 버튼: pill + 중앙 */
-.stButton { max-width: 584px; margin: 0 auto !important; }
+.stButton { max-width: 584px; margin: 0 auto !important; display: flex; justify-content: center; }
 .stButton > button {
     background: #ffffff !important;
     color: #000000 !important;
@@ -216,38 +216,50 @@ header { display: none !important; }
 """, unsafe_allow_html=True)
 
 # ── 에이전트 설정 ──────────────────────────────────────────────────────────────
-MODEL = "gemini-2.5-flash-lite-preview-06-17"  # 무료 티어 최고 한도 (1,000회/일)
+MODEL = "gemini-2.5-flash-lite-preview-06-17"
 
 
 def run_agent(client, system, prompt, use_search=False, **kwargs):
-    """Gemini Flash-Lite 호출. use_search는 grounding으로 처리."""
     try:
-        tools = []
-        if use_search:
-            tools = [{"google_search": {}}]
-
         full_prompt = f"{system}\n\n{prompt}" if system else prompt
-
-        if tools:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=full_prompt,
-                config={"tools": tools}
-            )
+        # 최신 SDK (0.8+) 방식
+        if hasattr(genai, 'GenerativeModel'):
+            model = genai.GenerativeModel(MODEL)
+            response = model.generate_content(full_prompt)
+            return response.text or ""
         else:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=full_prompt
-            )
-        return response.text or ""
+            # 구형 SDK fallback
+            response = genai.generate_text(prompt=full_prompt)
+            return response.result or ""
     except Exception as e:
         return f"오류: {e}"
 
 
 def find_careers_url(client, company, log):
     log(f"◎ {company} 채용 페이지 탐색 중...")
+
+    # 유명 회사 하드코딩 fallback
+    known = {
+        "apple": "https://jobs.apple.com",
+        "google": "https://careers.google.com",
+        "meta": "https://www.metacareers.com",
+        "amazon": "https://www.amazon.jobs",
+        "microsoft": "https://careers.microsoft.com",
+        "samsung": "https://www.samsung.com/us/careers",
+        "kakao": "https://careers.kakao.com",
+        "naver": "https://recruit.navercorp.com",
+        "netflix": "https://jobs.netflix.com",
+        "tesla": "https://www.tesla.com/careers",
+        "openai": "https://openai.com/careers",
+        "anthropic": "https://www.anthropic.com/careers",
+    }
+    co_lower = company.lower().strip()
+    for key, url in known.items():
+        if key in co_lower:
+            log(f"✓ 채용 페이지 발견 (기본 DB)", "ok")
+            return url
+
     prompt = f""""{company}" 회사의 공식 채용 페이지 URL을 알려줘.
-잘 알려진 회사라면 알고 있는 URL을 바로 사용해.
 JSON으로만 반환: {{"url": "https://...", "source": "공식/LinkedIn/기타"}}
 다른 텍스트 없이 JSON만."""
     result = run_agent(client, None, prompt, use_search=False)
@@ -265,8 +277,11 @@ JSON으로만 반환: {{"url": "https://...", "source": "공식/LinkedIn/기타"
     if url_match:
         log("✓ URL 발견", "ok")
         return url_match.group()
-    log("! 채용 페이지를 찾지 못했습니다.", "dim")
-    return None
+
+    # 최후 fallback: LinkedIn
+    fallback = f"https://www.linkedin.com/jobs/search/?keywords={company.replace(' ','+')}"
+    log(f"→ LinkedIn 검색으로 대체", "ok")
+    return fallback
 
 
 def collect_jobs(client, company, careers_url, filter_keyword, log):
@@ -735,7 +750,7 @@ with st.container():
                                 label_visibility="collapsed")
         st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
 
-        run_btn = st.button("◎  분석 시작", disabled=not (api_key and company))
+        run_btn = st.button("Start Analyzing", disabled=not (api_key and company))
 
     st.markdown('</div>', unsafe_allow_html=True)
 
